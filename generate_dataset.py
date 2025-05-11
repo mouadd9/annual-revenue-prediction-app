@@ -167,6 +167,8 @@ def generate_demographics(n_samples=N_SAMPLES):
 def generate_income(demographics_df):
     """
     Génère des revenus annuels basés sur les caractéristiques démographiques.
+    Les revenus suivent une distribution réaliste tout en respectant les contraintes
+    statistiques du HCP.
     
     Args:
         demographics_df (pandas.DataFrame): DataFrame contenant les caractéristiques démographiques
@@ -174,323 +176,126 @@ def generate_income(demographics_df):
     Returns:
         numpy.ndarray: Tableau des revenus annuels générés
     """
-    # Revenu de base selon le milieu (urbain/rural)
-    base_income = np.where(demographics_df['milieu'] == 'urbain', 
-                          REVENU_MOYEN_URBAIN * 0.7,  # Point de départ plus bas pour permettre les ajustements
-                          REVENU_MOYEN_RURAL * 0.7)
+    import numpy as np
+    from scipy import stats
     
-    # Facteur éducation (éducation supérieure = revenu plus élevé)
-    education_multiplier = demographics_df['niveau_education'].map({
-        'sans_niveau': 0.6,
-        'fondamental': 0.8,
-        'secondaire': 1.1,
-        'supérieur': 1.8
-    })
+    # Création d'une copie pour éviter les modifications du DataFrame original
+    df = demographics_df.copy()
     
-    # Facteur expérience (plus d'expérience = revenu plus élevé, jusqu'à un certain point)
-    experience_multiplier = 1 + (demographics_df['annees_experience'] * 0.02).clip(0, 0.6)
+    # Séparation urbain/rural pour un traitement indépendant
+    urban_mask = df['milieu'] == 'urbain'
+    rural_mask = ~urban_mask
     
-    # Facteur genre (reflète l'écart de salaire homme-femme)
-    gender_multiplier = demographics_df['sexe'].map({
-        'homme': 1.2,
-        'femme': 0.9
-    })
+    # Initialisation du vecteur de revenus
+    income = np.zeros(len(df))
     
-    # Facteur catégorie socioprofessionnelle (groupes supérieurs = revenu plus élevé)
-    socio_prof_multiplier = demographics_df['categorie_socioprofessionnelle'].map({
-        'Groupe_1': 1.9,  # Cadres supérieurs, professions libérales
-        'Groupe_2': 1.5,  # Cadres moyens, commerçants
-        'Groupe_3': 1.2,  # Inactifs (retraités, etc.)
-        'Groupe_4': 0.9,  # Travailleurs agricoles
-        'Groupe_5': 0.8,  # Opérateurs de machines, artisans
-        'Groupe_6': 0.7   # Travailleurs non qualifiés, chômeurs
-    })
+    # Fonction pour générer les revenus pour un segment spécifique
+    def generate_segment_income(segment_mask, mean_target, pct_below_mean):
+        segment_size = segment_mask.sum()
+        segment_df = df.loc[segment_mask].copy()
+        
+        # Calcul des paramètres optimaux de la distribution log-normale
+        # Dans une log-normale, la proportion sous la moyenne est liée au sigma
+        # Nous devons trouver le sigma qui donne exactement le pourcentage cible
+        
+        # Pour une log-normale, le pourcentage sous la moyenne est:
+        # P(X < μ) = Φ(σ/sqrt(2)), où Φ est la CDF de la loi normale standard
+        
+        # Inversement, à partir du pourcentage, on peut calculer sigma:
+        # sigma = sqrt(2) * Φ^(-1)(pct_below_mean)
+        # où Φ^(-1) est l'inverse de la CDF de la loi normale standard
+        
+        # Calcul de sigma optimal
+        sigma = np.sqrt(2) * stats.norm.ppf(pct_below_mean)
+        
+        # Calcul de mu (tel que la moyenne de la distribution log-normale soit mean_target)
+        # Pour une log-normale, E[X] = exp(mu + sigma²/2)
+        # D'où: mu = ln(mean_target) - sigma²/2
+        mu = np.log(mean_target) - (sigma**2)/2
+        
+        # Génération du revenu de base avec distribution log-normale optimisée
+        base_income = np.random.lognormal(mean=mu, sigma=sigma, size=segment_size)
+        
+        # Vérification (uniquement pour le développement, peut être commenté en production)
+        actual_mean = base_income.mean()
+        actual_pct_below = (base_income < mean_target).mean()
+        print(f"Distribution - Mean: {actual_mean:.2f} (target: {mean_target:.2f}), "
+              f"Pct below: {actual_pct_below*100:.1f}% (target: {pct_below_mean*100:.1f}%)")
+        
+        # Matrice de modifications basée sur les caractéristiques démographiques
+        modifiers = np.ones(segment_size)
+        
+        # --- Application des facteurs influençant le revenu ---
+        
+        # 1. Niveau d'éducation
+        education_impact = {
+            'sans_niveau': 0.75,
+            'fondamental': 0.9,
+            'secondaire': 1.1,
+            'supérieur': 1.4
+        }
+        for edu, impact in education_impact.items():
+            modifiers[segment_df['niveau_education'] == edu] *= impact
+        
+        # 2. Années d'expérience (effet modéré avec plafond)
+        exp_values = segment_df['annees_experience'].values
+        exp_modifier = 1 + 0.01 * exp_values
+        exp_modifier = np.minimum(exp_modifier, 1.3)
+        modifiers *= exp_modifier
+        
+        # 3. Catégorie socioprofessionnelle
+        socio_prof_impact = {
+            'Groupe_1': 1.5,  # Cadres supérieurs
+            'Groupe_2': 1.3,  # Cadres moyens
+            'Groupe_3': 1.1,  # Inactifs avec revenus
+            'Groupe_4': 0.9,  # Agriculteurs
+            'Groupe_5': 0.85, # Artisans, ouvriers
+            'Groupe_6': 0.8   # Travailleurs non qualifiés
+        }
+        for group, impact in socio_prof_impact.items():
+            modifiers[segment_df['categorie_socioprofessionnelle'] == group] *= impact
+        
+        # 4. Sexe (facteurs modérés)
+        modifiers[segment_df['sexe'] == 'homme'] *= 1.1
+        modifiers[segment_df['sexe'] == 'femme'] *= 0.9
+        
+        # 5. Âge (fonction en cloche)
+        age_values = segment_df['age'].values
+        age_modifier = 0.85 + 0.3 * np.exp(-0.002 * (age_values - 45)**2)
+        modifiers *= age_modifier
+        
+        # Appliquer les multiplicateurs en préservant les rangs
+        # Pour ce faire, nous réorganisons les revenus de base selon les rangs des modificateurs
+        
+        # Trier les revenus de base
+        sorted_base_income = np.sort(base_income)
+        
+        # Obtenir les rangs des modificateurs
+        modifier_ranks = stats.rankdata(modifiers, method='ordinal') - 1
+        
+        # Réorganiser les revenus de base selon les rangs des modificateurs
+        # Cela préserve la distribution tout en créant une corrélation avec les facteurs démographiques
+        income_with_factors = np.zeros_like(base_income)
+        for i, rank in enumerate(modifier_ranks):
+            income_with_factors[i] = sorted_base_income[rank]
+        
+        # Réajuster la moyenne pour compenser les effets de la réorganisation
+        adjusted_income = income_with_factors * (mean_target / income_with_factors.mean())
+        
+        return adjusted_income
     
-    # Facteur possession de biens (indique un potentiel de revenu plus élevé)
-    asset_multiplier = 1 + 0.1 * demographics_df['possession_voiture'] + \
-                          0.15 * demographics_df['possession_logement'] + \
-                          0.2 * demographics_df['possession_terrain']
+    # Génération des revenus pour la population urbaine
+    if urban_mask.sum() > 0:
+        urban_income = generate_segment_income(urban_mask, REVENU_MOYEN_URBAIN, PCT_BELOW_MEAN_URBAIN)
+        income[urban_mask] = urban_income
     
-    # Calcul du revenu préliminaire en combinant tous les facteurs
-    income = base_income * education_multiplier * experience_multiplier * \
-             gender_multiplier * socio_prof_multiplier * asset_multiplier
-    
-    # Ajout de variation aléatoire avec différentes distributions pour urbain vs rural
-    rural_mask = demographics_df['milieu'] == 'rural'
-    urban_mask = ~rural_mask
-    
-    # Distribution plus asymétrique pour les zones rurales
-    if urban_mask.sum() > 0: 
-       income[urban_mask] = income[urban_mask] * np.random.lognormal(0, 0.25, size=urban_mask.sum())
-    if rural_mask.sum() > 0: 
-       income[rural_mask] = income[rural_mask] * np.random.lognormal(0, 0.45, size=rural_mask.sum())
-
-    # Assurer des valeurs positives
-    income = np.maximum(1e-6, income) 
-    
-    # Ajout de valeurs aberrantes élevées (individus très riches)
-    outlier_mask = np.random.random(size=len(demographics_df)) > 0.995  # 0.5% de valeurs aberrantes
-    income[outlier_mask] = income[outlier_mask] * np.random.uniform(3, 8, size=sum(outlier_mask))
+    # Génération des revenus pour la population rurale
+    if rural_mask.sum() > 0:
+        rural_income = generate_segment_income(rural_mask, REVENU_MOYEN_RURAL, PCT_BELOW_MEAN_RURAL)
+        income[rural_mask] = rural_income
     
     return income
 
-def adjust_income_to_match_statistics(demographics_df, income_input):
-    """
-    Ajuste les revenus générés pour respecter les contraintes statistiques du HCP.
-    
-    Args:
-        demographics_df (pandas.DataFrame): DataFrame contenant les caractéristiques démographiques
-        income_input (numpy.ndarray): Tableau des revenus initiaux à ajuster
-        
-    Returns:
-        numpy.ndarray: Tableau des revenus ajustés
-    """
-    adjusted_income = income_input.copy()
-    min_income_val = 1.0
-
-    # --- Phase 1: Ajustement des segments urbains et ruraux avec pré-compensation ---
-    # Facteur de pré-compensation pour l'ajustement global ultérieur
-    global_scaling_compensation_factor = 1.009817 
-
-    target_urban_phase1 = REVENU_MOYEN_URBAIN / global_scaling_compensation_factor
-    target_rural_phase1 = REVENU_MOYEN_RURAL / global_scaling_compensation_factor
-    
-    print(f"--- Phase 1 Cibles de pré-compensation: Urbain={target_urban_phase1:.2f}, Rural={target_rural_phase1:.2f} ---")
-
-    # Ajustement urbain
-    urban_mask = demographics_df['milieu'] == 'urbain'
-    if urban_mask.sum() > 0:
-        current_urban_incomes_original = adjusted_income[urban_mask].copy()
-        N_urban = len(current_urban_incomes_original)
-        sorted_urban_incomes = np.sort(current_urban_incomes_original.copy())
-        
-        pre_scale_urban_mean = sorted_urban_incomes.mean()
-        if pre_scale_urban_mean <= 0: pre_scale_urban_mean = min_income_val 
-        target_pct_below_urban = PCT_BELOW_MEAN_URBAIN # 0.659
-        urban_cutoff_idx = int(N_urban * target_pct_below_urban)
-        urban_cutoff_idx = max(0, min(urban_cutoff_idx, N_urban -1 if N_urban > 0 else 0))
-
-        # Facteurs de mise en forme urbaine modifiés pour corriger le problème de percentile
-        urban_shaping_below = 0.95  # Changé de 0.99 pour augmenter le % sous la moyenne
-        urban_shaping_above = 1.05  # Changé de 1.01 pour augmenter le % sous la moyenne
-
-        if N_urban > 1 : 
-            if urban_cutoff_idx > 0 and urban_cutoff_idx <= N_urban:
-                if sorted_urban_incomes[urban_cutoff_idx-1] >= pre_scale_urban_mean: 
-                    val_to_adjust = sorted_urban_incomes[urban_cutoff_idx-1]
-                    if val_to_adjust > 0: 
-                        scale_factor = (pre_scale_urban_mean * urban_shaping_below) / val_to_adjust 
-                        sorted_urban_incomes[0:urban_cutoff_idx] *= scale_factor
-                    else: 
-                        sorted_urban_incomes[urban_cutoff_idx-1] = pre_scale_urban_mean * urban_shaping_below
-            
-            if urban_cutoff_idx < N_urban : 
-                if sorted_urban_incomes[urban_cutoff_idx] < pre_scale_urban_mean: 
-                    val_to_adjust = sorted_urban_incomes[urban_cutoff_idx]
-                    if val_to_adjust > 0 :
-                        scale_factor = (pre_scale_urban_mean * urban_shaping_above) / val_to_adjust
-                        sorted_urban_incomes[urban_cutoff_idx:N_urban] *= scale_factor
-                    elif val_to_adjust <= 0 and pre_scale_urban_mean > 0: 
-                        sorted_urban_incomes[urban_cutoff_idx] = pre_scale_urban_mean * urban_shaping_above
-            
-            sorted_urban_incomes[:] = np.sort(sorted_urban_incomes)
-        
-        sorted_urban_incomes = np.maximum(min_income_val, sorted_urban_incomes)
-        current_shaped_urban_mean = sorted_urban_incomes.mean()
-        if current_shaped_urban_mean <= 0 : current_shaped_urban_mean = min_income_val
-
-        # Mise à l'échelle pour atteindre la cible pré-compensée pour la Phase 1
-        urban_scale_factor = target_urban_phase1 / current_shaped_urban_mean 
-        final_sorted_urban_incomes = sorted_urban_incomes * urban_scale_factor
-        final_sorted_urban_incomes = np.maximum(min_income_val, final_sorted_urban_incomes)
-        
-        temp_urban_final = np.zeros_like(final_sorted_urban_incomes)
-        temp_urban_final[np.argsort(current_urban_incomes_original)] = final_sorted_urban_incomes 
-        adjusted_income[urban_mask] = temp_urban_final
-
-    # Ajustement rural
-    rural_mask = demographics_df['milieu'] == 'rural'
-    if rural_mask.sum() > 0:
-        current_rural_incomes_original = adjusted_income[rural_mask].copy()
-        N_rural = len(current_rural_incomes_original)
-        sorted_rural_incomes = np.sort(current_rural_incomes_original.copy())
-
-        pre_scale_rural_mean = sorted_rural_incomes.mean()
-        if pre_scale_rural_mean <= 0: pre_scale_rural_mean = min_income_val
-        target_pct_below_rural = PCT_BELOW_MEAN_RURAL # 0.854
-        rural_cutoff_idx = int(N_rural * target_pct_below_rural)
-        rural_cutoff_idx = max(0, min(rural_cutoff_idx, N_rural -1 if N_rural > 0 else 0)) 
-        
-        # Facteurs de mise en forme rurale
-        rural_shaping_below = 0.62
-        rural_shaping_above = 1.53
-        
-        if N_rural > 1: 
-            if rural_cutoff_idx > 0 and rural_cutoff_idx <= N_rural: 
-                if sorted_rural_incomes[rural_cutoff_idx-1] >= pre_scale_rural_mean: 
-                    val_to_adjust = sorted_rural_incomes[rural_cutoff_idx-1]
-                    if val_to_adjust > 0: 
-                        scale_factor = (pre_scale_rural_mean * rural_shaping_below) / val_to_adjust 
-                        sorted_rural_incomes[0:rural_cutoff_idx] *= scale_factor
-                    else: 
-                        sorted_rural_incomes[rural_cutoff_idx-1] = pre_scale_rural_mean * rural_shaping_below
-            
-            if rural_cutoff_idx < N_rural: 
-                if sorted_rural_incomes[rural_cutoff_idx] < pre_scale_rural_mean: 
-                    val_to_adjust = sorted_rural_incomes[rural_cutoff_idx]
-                    if val_to_adjust > 0 :
-                        scale_factor = (pre_scale_rural_mean * rural_shaping_above) / val_to_adjust
-                        sorted_rural_incomes[rural_cutoff_idx:N_rural] *= scale_factor
-                    elif val_to_adjust <= 0 and pre_scale_rural_mean > 0: 
-                        sorted_rural_incomes[rural_cutoff_idx] = pre_scale_rural_mean * rural_shaping_above
-            
-            sorted_rural_incomes[:] = np.sort(sorted_rural_incomes)
-        
-        sorted_rural_incomes = np.maximum(min_income_val, sorted_rural_incomes)
-        current_shaped_rural_mean = sorted_rural_incomes.mean()
-        if current_shaped_rural_mean <=0: current_shaped_rural_mean = min_income_val
-        
-        # Mise à l'échelle pour atteindre la cible pré-compensée pour la Phase 1
-        rural_scale_factor = target_rural_phase1 / current_shaped_rural_mean
-        final_sorted_rural_incomes = sorted_rural_incomes * rural_scale_factor
-        final_sorted_rural_incomes = np.maximum(min_income_val, final_sorted_rural_incomes)
-
-        temp_rural_final = np.zeros_like(final_sorted_rural_incomes)
-        temp_rural_final[np.argsort(current_rural_incomes_original)] = final_sorted_rural_incomes
-        adjusted_income[rural_mask] = temp_rural_final
-    
-    # --- Phase 2: Ajustement global ---
-    print("\n--- Démarrage de la phase d'ajustement global ---")
-    
-    original_order_global = np.argsort(adjusted_income)
-    sorted_global_income = np.sort(adjusted_income.copy()) 
-    N_global = len(sorted_global_income)
-
-    # Facteurs de mise en forme globale
-    global_shaping_factor_below = 0.85 
-    global_shaping_factor_above = 1.20
-    
-    for iteration in range(1): 
-        print(f"Itération d'ajustement global: {iteration + 1}")
-        pre_scale_global_mean = sorted_global_income.mean()
-        if pre_scale_global_mean <= 0: pre_scale_global_mean = min_income_val
-
-        global_cutoff_idx = int(N_global * PCT_BELOW_MEAN_GLOBAL) 
-        global_cutoff_idx = max(0, min(global_cutoff_idx, N_global - 1 if N_global > 0 else 0))
-
-        if N_global > 1:
-            if global_cutoff_idx > 0 and global_cutoff_idx <= N_global :
-                if sorted_global_income[global_cutoff_idx - 1] >= pre_scale_global_mean * global_shaping_factor_below : 
-                    val_to_adjust_low = sorted_global_income[global_cutoff_idx - 1]
-                    scale_factor_low = (pre_scale_global_mean * global_shaping_factor_below) / val_to_adjust_low if val_to_adjust_low > 0 else 1.0
-                    sorted_global_income[0:global_cutoff_idx] *= scale_factor_low
-                    if val_to_adjust_low <= 0 : sorted_global_income[global_cutoff_idx - 1] = pre_scale_global_mean * global_shaping_factor_below
-            
-            if global_cutoff_idx < N_global:
-                if sorted_global_income[global_cutoff_idx] < pre_scale_global_mean * global_shaping_factor_above: 
-                    val_to_adjust_high = sorted_global_income[global_cutoff_idx]
-                    scale_factor_high = (pre_scale_global_mean * global_shaping_factor_above) / val_to_adjust_high if val_to_adjust_high > 0 else 1.0
-                    sorted_global_income[global_cutoff_idx:N_global] *= scale_factor_high
-                    if val_to_adjust_high <= 0 and pre_scale_global_mean > 0: sorted_global_income[global_cutoff_idx] = pre_scale_global_mean * global_shaping_factor_above
-            
-            sorted_global_income[:] = np.sort(sorted_global_income)
-
-        sorted_global_income = np.maximum(min_income_val, sorted_global_income)
-
-        current_shaped_global_mean = sorted_global_income.mean()
-        if current_shaped_global_mean <= 0: current_shaped_global_mean = min_income_val
-        
-        global_scale_factor = REVENU_MOYEN_GLOBAL / current_shaped_global_mean
-        sorted_global_income *= global_scale_factor 
-        
-    final_sorted_global_income = np.maximum(min_income_val, sorted_global_income)
-
-    final_adjusted_income_globally = np.zeros_like(final_sorted_global_income)
-    final_adjusted_income_globally[original_order_global] = final_sorted_global_income
-    adjusted_income = final_adjusted_income_globally
-
-    # --- Phase 3: Ajustement final des moyennes exactes ---
-    print("\n--- Démarrage de la phase d'ajustement final des moyennes exactes ---")
-    
-    # Ajustement exact des moyennes urbaines et rurales
-    urban_mask = demographics_df['milieu'] == 'urbain'
-    rural_mask = ~urban_mask
-    
-    urban_mean_current = adjusted_income[urban_mask].mean() if urban_mask.sum() > 0 else 0
-    rural_mean_current = adjusted_income[rural_mask].mean() if rural_mask.sum() > 0 else 0
-    
-    # Mise à l'échelle directe pour atteindre les moyennes cibles exactes
-    if urban_mean_current > 0:
-        urban_exact_scale = REVENU_MOYEN_URBAIN / urban_mean_current
-        adjusted_income[urban_mask] *= urban_exact_scale
-    
-    if rural_mean_current > 0:
-        rural_exact_scale = REVENU_MOYEN_RURAL / rural_mean_current
-        adjusted_income[rural_mask] *= rural_exact_scale
-    
-    # Vérification des pourcentages après mise à l'échelle
-    overall_below_after_scaling = (adjusted_income < REVENU_MOYEN_GLOBAL).mean()
-    urban_below_after_scaling = (adjusted_income[urban_mask] < REVENU_MOYEN_URBAIN).mean() if urban_mask.sum() > 0 else 0
-    rural_below_after_scaling = (adjusted_income[rural_mask] < REVENU_MOYEN_RURAL).mean() if rural_mask.sum() > 0 else 0
-    
-    # Si le pourcentage urbain est encore incorrect, effectuer un ajustement supplémentaire
-    if abs(urban_below_after_scaling - PCT_BELOW_MEAN_URBAIN) > 0.01 and urban_mask.sum() > 0:
-        print("Exécution d'un ajustement supplémentaire du pourcentage urbain")
-        
-        # Tri des revenus urbains
-        urban_incomes = adjusted_income[urban_mask].copy()
-        sorted_urban = np.sort(urban_incomes)
-        N_urban = len(sorted_urban)
-        
-        # Calcul de l'indice de coupure cible
-        target_cutoff_idx = int(N_urban * PCT_BELOW_MEAN_URBAIN)
-        target_cutoff_idx = max(0, min(target_cutoff_idx, N_urban - 1))
-        
-        # Application d'une mise en forme plus agressive
-        sorted_urban[target_cutoff_idx-1] = REVENU_MOYEN_URBAIN * 0.98
-        sorted_urban[target_cutoff_idx] = REVENU_MOYEN_URBAIN * 1.02
-        
-        # Assurer une transition en douceur des valeurs
-        smooth_factor = 0.01
-        for i in range(1, min(100, target_cutoff_idx)):
-            sorted_urban[target_cutoff_idx-i] = REVENU_MOYEN_URBAIN * (0.98 - smooth_factor*i)
-        
-        for i in range(1, min(100, N_urban - target_cutoff_idx)):
-            if target_cutoff_idx+i < N_urban:
-                sorted_urban[target_cutoff_idx+i] = REVENU_MOYEN_URBAIN * (1.02 + smooth_factor*i)
-        
-        # Remise à l'échelle pour maintenir la moyenne exacte
-        sorted_urban = sorted_urban * (REVENU_MOYEN_URBAIN * N_urban / sorted_urban.sum())
-        
-        # Remappage aux positions originales
-        original_order = np.argsort(urban_incomes)
-        reordered_urban = np.zeros_like(sorted_urban)
-        for i in range(N_urban):
-            reordered_urban[original_order[i]] = sorted_urban[i]
-        
-        adjusted_income[urban_mask] = reordered_urban
-    
-    # --- Vérification finale ---
-    overall_mean_actual = adjusted_income.mean()
-    urban_actual_mask = demographics_df['milieu'] == 'urbain'
-    rural_actual_mask = demographics_df['milieu'] == 'rural'
-
-    urban_mean_actual = adjusted_income[urban_actual_mask].mean() if urban_actual_mask.sum() > 0 else 0
-    rural_mean_actual = adjusted_income[rural_actual_mask].mean() if rural_actual_mask.sum() > 0 else 0
-    
-    overall_below_actual = (adjusted_income < REVENU_MOYEN_GLOBAL).mean()
-    urban_below_actual = (adjusted_income[urban_actual_mask] < REVENU_MOYEN_URBAIN).mean() if urban_actual_mask.sum() > 0 else 0
-    rural_below_actual = (adjusted_income[rural_actual_mask] < REVENU_MOYEN_RURAL).mean() if rural_actual_mask.sum() > 0 else 0
-
-    print(f"\nCible finale vs. Réalité (Après toutes les phases d'ajustement):")
-    print(f"Moyenne globale: Cible {REVENU_MOYEN_GLOBAL:.2f} vs Réalité {overall_mean_actual:.2f}")
-    print(f"Moyenne urbaine: Cible {REVENU_MOYEN_URBAIN:.2f} vs Réalité {urban_mean_actual:.2f}")
-    print(f"Moyenne rurale: Cible {REVENU_MOYEN_RURAL:.2f} vs Réalité {rural_mean_actual:.2f}")
-    print(f"% global sous REVENU_MOYEN_GLOBAL: Cible {PCT_BELOW_MEAN_GLOBAL*100:.1f}% vs Réalité {overall_below_actual*100:.1f}%")
-    print(f"% urbain sous REVENU_MOYEN_URBAIN: Cible {PCT_BELOW_MEAN_URBAIN*100:.1f}% vs Réalité {urban_below_actual*100:.1f}%")
-    print(f"% rural sous REVENU_MOYEN_RURAL: Cible {PCT_BELOW_MEAN_RURAL*100:.1f}% vs Réalité {rural_below_actual*100:.1f}%")
-    
-    return adjusted_income
 
 def ajouter_valeurs_manquantes(df, taux_manquant=0.02):
     """
@@ -774,9 +579,8 @@ def main():
     # Génération des revenus initiaux
     initial_income = generate_income(demographics_df)
     # Ajustement des revenus pour respecter les contraintes statistiques
-    final_income = adjust_income_to_match_statistics(demographics_df, initial_income)
     # Ajout des revenus au DataFrame
-    demographics_df['revenu_annuel'] = final_income
+    demographics_df['revenu_annuel'] = initial_income
     
     # Application des problèmes de qualité des données
     print("=== Ajout de problèmes de qualité au dataset ===")
